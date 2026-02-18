@@ -1,0 +1,868 @@
+"""
+AuraBeat — Video (top-left) + Circular Gear Menu + Right Piano Roll (¼ width)
+- Fullscreen by default (F11 toggle, ESC exit). Preference is remembered.
+- Right panel uses dusk gray background (no gradient), with razor-thin feathered boundary accents.
+- Bottom mini keyboard with centered black keys (C#, D#, F#, G#, A#).
+- Minimal circular gear button (⚙) to the left of the video feed opens a rounded quick menu.
+- Gesture recognition: Open Hand, Fist, Point, Thumbs Up — with rich visual feedback.
+  • GestureHUD Kivy widget sits below the video preview with colored glow badges per hand.
+  • OpenCV frame overlay draws a colored border flash + icon badge directly on the video.
+  • Console prints debounced emoji-prefixed gesture events.
+
+Hand positions that trigger each gesture
+─────────────────────────────────────────
+  🖐  Open Hand  — all four fingers fully extended, palm facing camera
+  ✊  Fist       — all fingers curled into palm, thumb tucked or alongside
+  ☝️  Point      — only index finger pointing up, other fingers curled
+  👍  Thumbs Up  — thumb pointing up/out, all four fingers curled into fist
+
+Run:
+    python aura_video_with_roll.py
+"""
+
+import json
+import threading
+import time
+from pathlib import Path
+
+import cv2
+import numpy as np
+from kivy.app import App
+from kivy.clock import Clock
+from kivy.core.window import Window
+from kivy.graphics import (Color, Rectangle, InstructionGroup, Line,
+                           Ellipse, RoundedRectangle)
+from kivy.graphics.texture import Texture
+from kivy.lang import Builder
+from kivy.metrics import dp
+from kivy.animation import Animation
+from kivy.properties import NumericProperty, BooleanProperty, StringProperty, ListProperty
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.floatlayout import FloatLayout
+from kivy.uix.image import Image
+from kivy.uix.widget import Widget
+from kivy.uix.button import Button
+from kivy.uix.label import Label
+
+
+# --- Try to import your existing tracker ---
+try:
+    from hand_tracking.hands import HandTracker
+    _HAS_TRACKER = True
+except Exception as e:
+    print("Could not import HandTracker:", e)
+    _HAS_TRACKER = False
+
+
+# ---------------------------------------------------------------------------
+# Gesture Recognition
+# ---------------------------------------------------------------------------
+
+# MediaPipe hand landmark indices
+# Fingertips:  thumb=4, index=8, middle=12, ring=16, pinky=20
+# PIP joints:  index=6, middle=10, ring=14, pinky=18
+# MCP joints:  index=5, middle=9,  ring=13, pinky=17
+# Thumb IP:    3,  thumb MCP: 2,  wrist: 0
+
+_FINGERTIP_IDS  = [8, 12, 16, 20]   # index, middle, ring, pinky
+_FINGER_PIP_IDS = [6, 10, 14, 18]
+_THUMB_TIP      = 4
+_THUMB_IP       = 3
+_WRIST          = 0
+
+
+def _finger_extended(lms, tip_id, pip_id):
+    """
+    Returns True if the finger (non-thumb) is extended.
+    A finger is extended when its tip is further from the wrist than its PIP joint.
+    Using Euclidean distance to the wrist avoids issues with hand rotation.
+    """
+    wrist = np.array([lms[_WRIST].x, lms[_WRIST].y])
+    tip   = np.array([lms[tip_id].x, lms[tip_id].y])
+    pip   = np.array([lms[pip_id].x, lms[pip_id].y])
+    return float(np.linalg.norm(tip - wrist)) > float(np.linalg.norm(pip - wrist))
+
+
+def _thumb_extended(lms):
+    """
+    Thumb extension: tip is to the left of (or right of, depending on handedness)
+    the IP joint. We use horizontal distance from the wrist as a simple heuristic.
+    """
+    wrist = np.array([lms[_WRIST].x, lms[_WRIST].y])
+    tip   = np.array([lms[_THUMB_TIP].x, lms[_THUMB_TIP].y])
+    ip    = np.array([lms[_THUMB_IP].x,  lms[_THUMB_IP].y])
+    return float(np.linalg.norm(tip - wrist)) > float(np.linalg.norm(ip - wrist))
+
+
+def classify_gesture(hand_landmarks) -> str:
+    """
+    Classify a single hand into one of:
+      - "Open Hand"   — all (or most) fingers extended
+      - "Fist"        — all fingers curled
+      - "Point"       — only index finger extended
+      - "Thumbs Up"   — thumb extended, other fingers curled  ← bonus 4th gesture
+      - ""            — unknown / transitional
+
+    `hand_landmarks` must have a .landmark list with .x/.y attributes
+    (compatible with mediapipe solutions AND our _LandmarkShim).
+    """
+    lms = hand_landmarks.landmark
+
+    extended = [_finger_extended(lms, tip, pip)
+                for tip, pip in zip(_FINGERTIP_IDS, _FINGER_PIP_IDS)]
+    # extended[0]=index, [1]=middle, [2]=ring, [3]=pinky
+    thumb_up = _thumb_extended(lms)
+
+    num_extended = sum(extended)
+
+    # --- Open Hand: 4 fingers extended (thumb optional) ---
+    if num_extended >= 4:
+        return "Open Hand"
+
+    # --- Fist: no fingers extended, thumb curled ---
+    if num_extended == 0 and not thumb_up:
+        return "Fist"
+
+    # --- Point: only index extended ---
+    if extended[0] and not extended[1] and not extended[2] and not extended[3]:
+        return "Point"
+
+    # --- Thumbs Up: thumb up, all fingers curled ---
+    if thumb_up and num_extended == 0:
+        return "Thumbs Up"
+
+    return ""
+
+
+
+# Per-gesture metadata used by both the OpenCV overlay and the Kivy HUD
+GESTURE_META = {
+    "Open Hand":  {"icon": "🖐",  "bgr": (60,  210,  60), "rgb": ( 60, 210,  60), "rgb_f": (0.24, 0.82, 0.24)},
+    "Fist":       {"icon": "✊",  "bgr": (60,   60, 220), "rgb": (220,  60,  60), "rgb_f": (0.24, 0.24, 0.86)},
+    "Point":      {"icon": "☝️", "bgr": (40,  170, 230), "rgb": (230, 170,  40), "rgb_f": (0.16, 0.67, 0.90)},
+    "Thumbs Up":  {"icon": "👍",  "bgr": (40,  210, 210), "rgb": (210, 210,  40), "rgb_f": (0.16, 0.82, 0.82)},
+    "":           {"icon": "❓",  "bgr": (140, 140, 140), "rgb": (140, 140, 140), "rgb_f": (0.55, 0.55, 0.55)},
+}
+
+
+def draw_gesture_overlay(frame_rgb: np.ndarray, gestures: list[str]) -> np.ndarray:
+    """
+    Draw per-hand gesture badges onto an RGB frame (called after cv2.flip).
+    """
+    if not gestures:
+        return frame_rgb
+
+    out = frame_rgb.copy()
+    h, w = out.shape[:2]
+
+    # ── 1. Colored border flash (dominant hand color) ──────────────────────
+    primary_meta = GESTURE_META.get(gestures[0], GESTURE_META[""])
+    border_color = primary_meta["rgb"]
+    border_thick = max(3, int(min(w, h) * 0.012))
+
+    border_overlay = out.copy()
+    cv2.rectangle(border_overlay, (0, 0), (w - 1, h - 1), border_color, border_thick)
+    cv2.addWeighted(border_overlay, 0.55, out, 0.45, 0, out)
+
+    # ── 2. Per-hand pill badges (top-right) ────────────────────────────────
+    font        = cv2.FONT_HERSHEY_DUPLEX
+    font_scale  = 0.65
+    thickness   = 2
+    line_h      = 34
+    pad_x, pad_y = 10, 6
+
+    for i, gesture in enumerate(gestures):
+        meta  = GESTURE_META.get(gesture, GESTURE_META[""])
+        color = meta["rgb"]
+
+        prefix = {
+            "Open Hand": "[OPEN] ",
+            "Fist":      "[FIST] ",
+            "Point":     "[POINT] ",
+            "Thumbs Up": "[THUMB] ",
+            "":          "[??] ",
+        }.get(gesture, "")
+        label = f"{prefix}Hand {i + 1}: {gesture}" if gesture else f"{prefix}Hand {i + 1}"
+
+        (tw, th), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+        bx2 = w - 10
+        bx1 = bx2 - tw - pad_x * 2
+        by1 = 10 + i * (th + line_h)
+        by2 = by1 + th + pad_y * 2
+
+        pill = out.copy()
+        cv2.rectangle(pill, (bx1, by1), (bx2, by2), (15, 17, 25), -1)
+        cv2.addWeighted(pill, 0.70, out, 0.30, 0, out)
+
+        cv2.rectangle(out, (bx1, by1), (bx1 + 4, by2), color, -1)
+        cv2.putText(out, label, (bx1 + 10, by2 - pad_y),
+                    font, font_scale, color, thickness, cv2.LINE_AA)
+
+    return out
+
+
+
+# ---------------------------------------------------------------------------
+# KV Layout
+# ---------------------------------------------------------------------------
+
+KV = r"""
+<RootView>:
+    orientation: "horizontal"
+    spacing: dp(6)
+    padding: dp(6)
+
+    # Center stage area with minimized video pinned top-left and gear button to its left
+    FloatLayout:
+        id: stage
+        canvas.before:
+            Color:
+                rgba: 0.05, 0.06, 0.08, 1
+            Rectangle:
+                pos: self.pos
+                size: self.size
+
+        # Circular gear button (⚙), anchored top-left with padding
+        CircleButton:
+            id: gear
+            text: "⚙"
+            size_hint: None, None
+            size: dp(42), dp(42)
+            pos: root.x + dp(8), root.top - dp(8) - self.height
+            on_release: app.toggle_quick_menu()
+
+        # Small video preview pinned to top-left, offset to the right of the gear button
+        VideoFeed:
+            id: video
+            size_hint: None, None
+            width: dp(420)
+            height: self.width * 9/16
+            pos_hint: {"top": 1}
+            x: root.ids.gear.right + dp(8)
+            fit_mode: "contain"
+
+        # Gesture HUD — sits directly below the video preview, same width
+        GestureHUD:
+            id: hud
+            size_hint: None, None
+            width: root.ids.video.width
+            height: dp(110)
+            x: root.ids.video.x
+            y: root.ids.video.y - self.height - dp(4)
+
+        # Rounded quick menu (hidden by default), positioned to the right of the gear
+        QuickMenu:
+            id: quickmenu
+            size_hint: None, None
+            size: dp(260), dp(260)
+            pos: root.ids.gear.right + dp(10), root.ids.gear.top - self.height - dp(4)
+            visible: False
+
+    # Right piano roll column — ~¼ width of the window
+    PianoRollPanel:
+        id: roll
+        size_hint_x: 0.25
+        keyboard_height_ratio: 0.18
+        show_chevrons: True
+"""
+
+
+# ---------------------------------------------------------------------------
+# Widgets
+# ---------------------------------------------------------------------------
+
+class RootView(BoxLayout):
+    pass
+
+
+class VideoFeed(Image):
+    """Image widget with rounded corners using a stencil mask."""
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.corner_radius_dp = dp(14)
+        self.draw_border = True
+
+        self._pre = InstructionGroup()
+        self.canvas.before.add(self._pre)
+        self._post = InstructionGroup()
+        self.canvas.after.add(self._post)
+
+        self.bind(pos=self._rebuild_stencil, size=self._rebuild_stencil)
+        self._rebuild_stencil()
+
+    def _rebuild_stencil(self, *args):
+        self._pre.clear()
+        self._post.clear()
+
+        from kivy.graphics import StencilPush, StencilUse, StencilUnUse, StencilPop, RoundedRectangle, Color, Line
+
+        self._pre.add(StencilPush())
+        self._pre.add(Color(1, 1, 1, 1))
+        self._mask = RoundedRectangle(
+            pos=self.pos,
+            size=self.size,
+            radius=[self.corner_radius_dp] * 4
+        )
+        self._pre.add(self._mask)
+        self._pre.add(StencilUse())
+
+        self._post.add(StencilUnUse())
+        self._post.add(Color(1, 1, 1, 1))
+        self._post.add(StencilPop())
+
+        if self.draw_border:
+            self._post.add(Color(1, 1, 1, 0.18))
+            self._post.add(Line(rounded_rectangle=(
+                self.x, self.y, self.width, self.height, self.corner_radius_dp
+            ), width=dp(1.2)))
+
+    def set_frame(self, rgb_frame: np.ndarray):
+        h, w = rgb_frame.shape[:2]
+        if not hasattr(self, "_texture") or self._texture is None or \
+           self._texture.width != w or self._texture.height != h:
+            texture = Texture.create(size=(w, h))
+            texture.flip_vertical()
+            self._texture = texture
+        self.texture = self._texture
+        self.texture.blit_buffer(rgb_frame.tobytes(), colorfmt="rgb", bufferfmt="ubyte")
+        self.canvas.ask_update()
+
+
+class CircleButton(Button):
+    """Minimal circular button."""
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.background_normal = ""
+        self.background_down = ""
+        self.background_color = (0, 0, 0, 0)
+        self.color = (0.9, 0.95, 1, 1)
+        self.font_size = dp(20)
+        self.bold = True
+        self._bg_instr = InstructionGroup()
+        self.canvas.before.add(self._bg_instr)
+        self.bind(pos=self._redraw_bg, size=self._redraw_bg)
+
+    def _redraw_bg(self, *args):
+        self._bg_instr.clear()
+        r = min(self.width, self.height) / 2.0
+        self._bg_instr.add(Color(0.12, 0.14, 0.18, 1))
+        self._bg_instr.add(Ellipse(pos=(self.x, self.y), size=(2*r, 2*r)))
+        self._bg_instr.add(Color(1, 1, 1, 0.18))
+        self._bg_instr.add(Line(circle=(self.center_x, self.center_y, r), width=dp(1.2)))
+
+
+class QuickMenu(Widget):
+    """Rounded rectangular quick menu that appears next to the gear button."""
+    visible = BooleanProperty(False)
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._bg_instr = InstructionGroup()
+        self.canvas.before.add(self._bg_instr)
+
+        self._items = BoxLayout(orientation="vertical", spacing=dp(6),
+                                padding=[dp(10), dp(10), dp(10), dp(10)])
+        self.add_widget(self._items)
+        for i in range(1, 6):
+            btn = Button(text=f"Placeholder {i}", size_hint_y=None, height=dp(36))
+            btn.background_normal = ""
+            btn.background_down = ""
+            btn.background_color = (0.18, 0.20, 0.25, 1)
+            btn.color = (0.9, 0.95, 1, 1)
+            self._items.add_widget(btn)
+
+        self.bind(pos=self._redraw_bg, size=self._redraw_bg, visible=self._apply_visibility)
+        self._apply_visibility()
+
+    def _apply_visibility(self, *args):
+        self.opacity = 1.0 if self.visible else 0.0
+        self.disabled = not self.visible
+
+    def _redraw_bg(self, *args):
+        self._bg_instr.clear()
+        self._bg_instr.add(Color(0.13, 0.14, 0.18, 0.98))
+        self._bg_instr.add(RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(12)]*4))
+        self._items.pos = (self.x, self.y)
+        self._items.size = (self.width, self.height)
+
+
+
+class GestureHUD(Widget):
+    """
+    A compact heads-up display that sits below the video preview.
+    Shows one badge per detected hand with:
+      - A colored glow/fill that matches the gesture
+      - An emoji icon  +  gesture name label
+      - A smooth fade-out after FADE_DELAY seconds of no detections
+    Call `update_gestures(gestures: list[str])` from the UI thread.
+    """
+
+    FADE_DELAY   = 1.8   # seconds before fading when hands disappear
+    BADGE_H      = 38    # pixel height of each badge row (in screen dp-ish)
+    BADGE_PAD_X  = 12
+    BADGE_PAD_Y  = 6
+    MAX_HANDS    = 2
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._gestures: list[str] = []
+        self._fade_event = None
+        self._g = InstructionGroup()
+        self.canvas.add(self._g)
+        self.opacity = 0.0   # hidden until first gesture
+        self.bind(pos=self._redraw, size=self._redraw)
+
+    # ── Public API ──────────────────────────────────────────────────────────
+
+    def update_gestures(self, gestures: list[str]):
+        """Call this on the Kivy UI thread with the latest gesture list."""
+        changed = (gestures != self._gestures)
+        self._gestures = list(gestures)
+
+        # Cancel any pending fade
+        if self._fade_event:
+            self._fade_event.cancel()
+            self._fade_event = None
+
+        if gestures:
+            # Snap visible immediately when a gesture appears / changes
+            Animation.cancel_all(self, "opacity")
+            self.opacity = 1.0
+            if changed:
+                self._redraw()
+            # Schedule fade-out after inactivity
+            self._fade_event = Clock.schedule_once(self._start_fade, self.FADE_DELAY)
+        else:
+            self._start_fade()
+
+    # ── Internal ────────────────────────────────────────────────────────────
+
+    def _start_fade(self, *args):
+        Animation(opacity=0.0, duration=0.5, t="out_quad").start(self)
+
+    def _redraw(self, *args):
+        self._g.clear()
+        if not self._gestures:
+            return
+
+        x0, y0 = self.x, self.y
+        W = self.width
+        row_h = dp(self.BADGE_H)
+        total_h = row_h * len(self._gestures) + dp(self.BADGE_PAD_Y) * (len(self._gestures) + 1)
+
+        # Overall dark pill background for the whole HUD
+        self._g.add(Color(0.09, 0.10, 0.13, 0.92))
+        self._g.add(RoundedRectangle(
+            pos=(x0, y0 + self.height - total_h),
+            size=(W, total_h),
+            radius=[dp(10)] * 4
+        ))
+
+        for i, gesture in enumerate(self._gestures):
+            meta = GESTURE_META.get(gesture, GESTURE_META[""])
+            r, g, b = meta["rgb_f"]
+            icon  = meta["icon"]
+            label = f"{icon}  {gesture}" if gesture else f"{icon}  —"
+
+            # Badge row y (top-down)
+            row_y = y0 + self.height - dp(self.BADGE_PAD_Y) * (i + 1) - row_h * (i + 1)
+
+            # Colored glow fill (low alpha) for the badge row
+            self._g.add(Color(r, g, b, 0.18))
+            self._g.add(RoundedRectangle(
+                pos=(x0 + dp(self.BADGE_PAD_X), row_y),
+                size=(W - dp(self.BADGE_PAD_X) * 2, row_h),
+                radius=[dp(7)] * 4
+            ))
+
+            # Colored left accent stripe
+            self._g.add(Color(r, g, b, 0.90))
+            self._g.add(RoundedRectangle(
+                pos=(x0 + dp(self.BADGE_PAD_X), row_y),
+                size=(dp(4), row_h),
+                radius=[dp(3)] * 4
+            ))
+
+        # We use Kivy Label children for the actual text (so emoji render properly)
+        # Remove old label children first
+        for child in list(self.children):
+            self.remove_widget(child)
+
+        for i, gesture in enumerate(self._gestures):
+            meta  = GESTURE_META.get(gesture, GESTURE_META[""])
+            r, g_c, b = meta["rgb_f"]
+            icon  = meta["icon"]
+            name  = gesture if gesture else "—"
+            hand_label = f"Hand {i + 1}"
+
+            row_y = y0 + self.height - dp(self.BADGE_PAD_Y) * (i + 1) - dp(self.BADGE_H) * (i + 1)
+
+            lbl = Label(
+                text=f"[b]{icon}[/b]  [color={int(r*255):02x}{int(g_c*255):02x}{int(b*255):02x}ff]{name}[/color]"
+                     f"  [color=606878ff]{hand_label}[/color]",
+                markup=True,
+                font_size=dp(14),
+                halign="left",
+                valign="middle",
+                size=(self.width - dp(self.BADGE_PAD_X) * 2 - dp(16), dp(self.BADGE_H)),
+                pos=(x0 + dp(self.BADGE_PAD_X) + dp(16), row_y),
+                text_size=(self.width - dp(self.BADGE_PAD_X) * 2 - dp(16), dp(self.BADGE_H)),
+            )
+            self.add_widget(lbl)
+
+
+class PianoRollPanel(Widget):
+    """Right-side piano roll panel (Synthesia-inspired)."""
+    keyboard_height_ratio = NumericProperty(0.18)
+    show_chevrons = BooleanProperty(True)
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._g = InstructionGroup()
+        self.canvas.add(self._g)
+        self._border_tex = None
+        self.bind(pos=self._redraw, size=self._redraw,
+                  keyboard_height_ratio=self._redraw, show_chevrons=self._redraw)
+
+    def _ensure_border_texture(self):
+        if self._border_tex is not None:
+            return
+        h, w = 256, 8
+        y = np.linspace(0.0, 1.0, h, dtype=np.float32)
+        alpha_line = 1.0 - np.abs(2.0 * y - 1.0)
+        color = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+        max_alpha = 0.85
+        arr = np.zeros((h, w, 4), dtype=np.uint8)
+        rgb = (color * 255).astype(np.uint8)
+        arr[..., 0] = rgb[0]
+        arr[..., 1] = rgb[1]
+        arr[..., 2] = rgb[2]
+        arr[..., 3] = (alpha_line[:, None] * max_alpha * 255).astype(np.uint8)
+        arr = np.flipud(arr)
+        tex = Texture.create(size=(w, h))
+        tex.blit_buffer(arr.tobytes(), colorfmt="rgba", bufferfmt="ubyte")
+        tex.wrap = 'clamp_to_edge'
+        self._border_tex = tex
+
+    def _redraw(self, *args):
+        self._g.clear()
+        self._ensure_border_texture()
+
+        x0, y0 = self.x, self.y
+        W, H = self.width, self.height
+        kb_h = max(dp(40), H * float(self.keyboard_height_ratio))
+
+        track_y = y0 + kb_h
+        track_h = max(0, H - kb_h)
+
+        self._g.add(Color(0.11, 0.12, 0.14, 1))
+        self._g.add(Rectangle(pos=(x0, y0), size=(W, H)))
+
+        if track_h > 0:
+            accent_len = max(dp(30), track_h / 3.0)
+            yc = track_y + track_h / 2.0
+            accent_y = yc - accent_len / 2.0
+            razor = max(1.0, dp(1.2))
+
+            self._g.add(Color(1, 1, 1, 1))
+            self._g.add(Rectangle(pos=(x0, accent_y), size=(razor, accent_len), texture=self._border_tex))
+            self._g.add(Rectangle(pos=(x0 + W - razor, accent_y), size=(razor, accent_len), texture=self._border_tex))
+
+        self._g.add(Color(0.07, 0.08, 0.10, 1))
+        self._g.add(Rectangle(pos=(x0, y0), size=(W, kb_h)))
+
+        key_w = W / 7.0
+        pad = dp(1.0)
+        self._g.add(Color(0.90, 0.92, 0.96, 1))
+        for i in range(7):
+            wx = x0 + i * key_w + pad
+            wy = y0 + pad
+            ww = max(0.0, key_w - 2 * pad)
+            wh = max(0.0, kb_h - 2 * pad)
+            if ww > 0 and wh > 0:
+                self._g.add(Rectangle(pos=(wx, wy), size=(ww, wh)))
+
+        black_boundaries = [0, 1, 3, 4, 5]
+        bw = key_w * 0.56
+        bh = kb_h * 0.62
+        self._g.add(Color(0.06, 0.06, 0.09, 1))
+        for j in black_boundaries:
+            cx = x0 + (j + 1) * key_w
+            bx = cx - bw / 2.0
+            by = y0 + kb_h - bh
+            if bw > 0 and bh > 0:
+                self._g.add(Rectangle(pos=(bx, by), size=(bw, bh)))
+
+        if self.show_chevrons and track_h > dp(20):
+            self._g.add(Color(0.2, 1.0, 0.4, 0.45))
+            yc = track_y + track_h / 2.0
+            margin = dp(12)
+            sz = dp(18)
+
+            xL = x0 + margin
+            self._g.add(Line(points=[xL + sz, yc + sz, xL, yc], width=dp(2)))
+            self._g.add(Line(points=[xL, yc, xL + sz, yc - sz], width=dp(2)))
+
+            xR = x0 + W - margin
+            self._g.add(Line(points=[xR - sz, yc + sz, xR, yc], width=dp(2)))
+            self._g.add(Line(points=[xR, yc, xR - sz, yc - sz], width=dp(2)))
+
+    def set_chevrons_visible(self, show: bool):
+        self.show_chevrons = bool(show)
+
+
+# ---------------------------------------------------------------------------
+# Video Controller (with gesture recognition integrated)
+# ---------------------------------------------------------------------------
+
+class VideoController:
+    """
+    Background capture + (optional) tracking + gesture recognition.
+    """
+
+    def __init__(self, video_widget: VideoFeed, cam_index=0, use_tracker=True):
+        self.video_widget   = video_widget
+        self.on_gesture     = None   # callback(gestures: list[str])
+        self.on_no_gesture  = None   # callback()
+
+        self.running          = False
+        self.tracker          = None
+        self.current_gestures: list[str] = []
+        self._prev_gestures:  list[str] = []  # for debouncing no-hands callback
+
+        print(f"[VideoController] _HAS_TRACKER = {_HAS_TRACKER}")
+
+        self.cam = cv2.VideoCapture(cam_index)
+        if not self.cam.isOpened():
+            raise RuntimeError(
+                f"Could not open webcam (index {cam_index}). "
+                "Try index 1 or close other apps using the camera."
+            )
+        print(f"[VideoController] Webcam {cam_index} opened OK")
+
+        if use_tracker and _HAS_TRACKER:
+            try:
+                self.tracker = HandTracker(
+                    max_hands=2,
+                    detection_confidence=0.7,
+                    tracking_confidence=0.7,
+                )
+                print("[VideoController] HandTracker initialised — gesture recognition ACTIVE")
+            except Exception as e:
+                print(f"[VideoController] HandTracker init failed: {e}")
+                self.tracker = None
+        else:
+            print("[VideoController] Running WITHOUT HandTracker — no gesture recognition")
+            if not _HAS_TRACKER:
+                print("  → Fix: make sure 'hand_tracking/hands.py' is on the Python path "
+                      "and that mediapipe is installed (`pip install mediapipe`).")
+
+    def start(self):
+        self.running = True
+        t = threading.Thread(target=self._loop, daemon=True)
+        t.start()
+        print("[VideoController] Capture thread started")
+
+    def stop(self):
+        self.running = False
+        try:
+            self.cam.release()
+        except Exception:
+            pass
+        try:
+            if self.tracker and hasattr(self.tracker, "close"):
+                self.tracker.close()
+        except Exception:
+            pass
+
+    def _loop(self):
+        frame_count   = 0
+        gesture_count = 0
+
+        while self.running:
+            ok, frame = self.cam.read()
+            if not ok:
+                time.sleep(0.02)
+                continue
+
+            frame_count += 1
+
+            # ── Diagnostic: print a heartbeat every 150 frames (~5s at 30fps) ──
+            if frame_count % 150 == 0:
+                print(f"[VideoController] ♥ {frame_count} frames read | "
+                      f"tracker={'ON' if self.tracker else 'OFF'} | "
+                      f"gestures detected so far: {gesture_count}")
+
+            annotated = frame
+            gestures: list[str] = []
+
+            if self.tracker:
+                try:
+                    results, annotated = self.tracker.process(frame)
+                    if results and results.multi_hand_landmarks:
+                        for hand_landmarks in results.multi_hand_landmarks:
+                            gesture = classify_gesture(hand_landmarks)
+                            gestures.append(gesture)
+                        gesture_count += len(gestures)
+                except Exception as e:
+                    print(f"[VideoController] Tracker error: {e}")
+                    annotated = frame
+
+            # Convert and mirror first, then draw text overlay so it isn't flipped
+            rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+            rgb = cv2.flip(rgb, 1)
+
+            if gestures:
+                rgb = draw_gesture_overlay(rgb, gestures)
+
+            captured_gestures  = list(gestures)
+            had_hands_before   = bool(self._prev_gestures)
+            has_hands_now      = bool(captured_gestures)
+            self._prev_gestures = captured_gestures
+
+            def _update(dt, im=rgb, gs=captured_gestures,
+                        had=had_hands_before, has=has_hands_now):
+                self.video_widget.set_frame(im)
+                self.current_gestures = gs
+
+                if has:
+                    # Always fire so HUD can update when gesture type changes
+                    if self.on_gesture:
+                        self.on_gesture(gs)
+                elif had and not has:
+                    # Only fire once when hands leave frame, not every empty frame
+                    if self.on_no_gesture:
+                        self.on_no_gesture()
+
+            Clock.schedule_once(_update)
+            time.sleep(0.001)
+
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+
+class AuraBeatVideoRollApp(App):
+    """
+    Remembers fullscreen preference and supports F11 toggle / ESC leave fullscreen.
+    Gesture events are printed to stdout; hook `controller.on_gesture` for
+    your own logic (e.g. triggering notes, UI actions, etc.).
+    """
+    CONFIG_FILE = "settings.json"
+
+    def _config_path(self) -> Path:
+        return Path(self.user_data_dir) / self.CONFIG_FILE
+
+    def _load_config(self):
+        p = self._config_path()
+        try:
+            if p.exists():
+                with open(p, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+            else:
+                cfg = {}
+        except Exception:
+            cfg = {}
+        self.fullscreen_pref = bool(cfg.get("fullscreen", True))
+
+    def _save_config(self):
+        p = self._config_path()
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({"fullscreen": bool(Window.fullscreen)}, f, indent=2)
+        except Exception as e:
+            print("Config save failed:", e)
+
+    def build(self):
+        self._load_config()
+        Window.fullscreen = 'auto' if self.fullscreen_pref else False
+
+        root = RootView()
+
+        self.controller = VideoController(
+            video_widget=root.ids.video,
+            cam_index=0,
+            use_tracker=True,
+        )
+
+        # Hook gesture callback — swap this out for real actions
+        self.controller.on_gesture    = self._on_gesture_detected
+        self.controller.on_no_gesture = self._on_no_hands
+        self._last_logged_gestures: list[str] = []
+
+        Clock.schedule_once(lambda dt: self.controller.start(), 0)
+        Window.bind(on_key_down=self._on_key_down)
+
+        return root
+
+    def _on_gesture_detected(self, gestures: list[str]):
+        """
+        Called on the Kivy UI thread whenever gesture state changes.
+
+        Drives two feedback channels:
+          1. GestureHUD — colored badge widget below the video preview
+          2. Console    — debounced emoji-prefixed log line
+        """
+        # ── Drive the HUD ──────────────────────────────────────────────────
+        hud = self.root.ids.get("hud")
+        if hud is not None:
+            hud.update_gestures(gestures)
+
+        # ── Console (debounced, emoji-prefixed) ────────────────────────────
+        if gestures != self._last_logged_gestures:
+            self._last_logged_gestures = list(gestures)
+            parts = []
+            for i, g in enumerate(gestures):
+                meta = GESTURE_META.get(g, GESTURE_META[""])
+                icon = meta["icon"]
+                parts.append(f"{icon} Hand {i + 1}: {g or '?'}")
+            print(f"[Gesture] {' | '.join(parts)}")
+
+    def _on_no_hands(self):
+        """Called when no hands are in frame — fades out the HUD."""
+        hud = self.root.ids.get("hud")
+        if hud is not None:
+            hud.update_gestures([])
+
+    def _on_key_down(self, window, key, scancode, codepoint, modifiers):
+        if key == 293:   # F11 — toggle fullscreen
+            Window.fullscreen = False if Window.fullscreen else 'auto'
+            self._save_config()
+            return True
+        if key == 27:    # ESC — exit fullscreen
+            if Window.fullscreen:
+                Window.fullscreen = False
+                self._save_config()
+                return True
+        return False
+
+    def toggle_quick_menu(self):
+        qm = self.root.ids.quickmenu
+        qm.visible = not qm.visible
+
+    def on_stop(self):
+        if hasattr(self, "controller"):
+            self.controller.stop()
+
+
+
+
+# Explicitly register all custom widget classes with Kivy's Factory BEFORE
+# Builder.load_string processes the KV rules. This is required because the KV
+# string references these classes by name, and the Factory must know about them
+# before rule application happens at RootView() instantiation time.
+from kivy.factory import Factory as _Factory
+_Factory.register("RootView",      cls=RootView)
+_Factory.register("VideoFeed",     cls=VideoFeed)
+_Factory.register("CircleButton",  cls=CircleButton)
+_Factory.register("QuickMenu",     cls=QuickMenu)
+_Factory.register("GestureHUD",    cls=GestureHUD)
+_Factory.register("PianoRollPanel", cls=PianoRollPanel)
+
+# Now load the KV rules — all classes are registered and resolvable
+Builder.load_string(KV)
+
+
+if __name__ == "__main__":
+    AuraBeatVideoRollApp().run()
