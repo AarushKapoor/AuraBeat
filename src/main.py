@@ -8,70 +8,91 @@ from kivy.logger import Logger
 
 import os
 
+print("DEBUG: main.py loaded")
+
 # --- Project imports ---
 try:
     from ui.kv import KV
+    print("DEBUG: KV imported successfully")
 except Exception as e:
-    raise ImportError(
-        "Failed to import KV from ui.kv. Ensure ui/kv.py defines a variable named KV (str)."
-    ) from e
-
+    print("ERROR: Failed to import KV:", e)
+    raise
 
 try:
     from ui.widgets import (
         RootView, VideoFeed, CircleButton, QuickMenu, GestureHUD,
-        PianoRollPanel, AirOverlayPanel, GradientBackground, LeftOptionsPanel,
-        PillButton, UpperDock, LowerDock
+        PianoRollPanel, AirOverlayPanel, GradientBackground,
+        LeftOptionsPanel, PillButton, UpperDock, LowerDock
     )
-
+    print("DEBUG: ui.widgets imported successfully")
 except Exception as e:
-    raise ImportError(
-        "Failed to import one or more widgets from ui.widgets. "
-        "Please ensure all classes exist and import side-effects don't fail."
-    ) from e
+    print("ERROR: Failed to import widgets:", e)
+    raise
 
-
+ExpandedPianoRollPopup = None
 try:
-    from hand_tracking.hands import HandTracker
+    ExpandedPianoRollPopup = __import__(
+        "ui.widgets.expanded_piano_roll",
+        fromlist=["ExpandedPianoRollPopup"]
+    ).ExpandedPianoRollPopup
+    print("DEBUG: ExpandedPianoRollPopup imported:", ExpandedPianoRollPopup)
 except Exception as e:
-    HandTracker = None
-    Logger.warning(f"HandTracker import failed; continuing without tracker. Error: {e}")
+    print("ERROR: ExpandedPianoRollPopup import failed:", e)
 
-try:
-    from hand_tracking.camera import VideoController
-except Exception as e:
-    VideoController = None
-    Logger.warning(f"VideoController import failed; continuing without camera. Error: {e}")
+# --- Optional subsystems ---
+def safe_import(name, import_fn):
+    try:
+        obj = import_fn()
+        print(f"DEBUG: {name} imported successfully")
+        return obj
+    except Exception as e:
+        print(f"WARNING: {name} import failed:", e)
+        return None
 
-try:
-    from mapping.scale_window import ScaleWindow
-except Exception as e:
-    ScaleWindow = None
-    Logger.warning(f"ScaleWindow import failed; continuing without scale window. Error: {e}")
+HandTracker = safe_import("HandTracker", lambda: __import__("hand_tracking.hands", fromlist=["HandTracker"]).HandTracker)
+VideoController = safe_import("VideoController", lambda: __import__("hand_tracking.camera", fromlist=["VideoController"]).VideoController)
+ScaleWindow = safe_import("ScaleWindow", lambda: __import__("mapping.scale_window", fromlist=["ScaleWindow"]).ScaleWindow)
+AudioEngine = safe_import("AudioEngine", lambda: __import__("audio.engine", fromlist=["AudioEngine"]).AudioEngine)
 
-# --- Audio engine (keyboard voice) ---
-try:
-    from audio.engine import AudioEngine
-except Exception as e:
-    AudioEngine = None
-    Logger.warning(f"AudioEngine import failed; continuing without audio. Error: {e}")
+Recorder = safe_import("Recorder", lambda: __import__("recording.recorder", fromlist=["Recorder"]).Recorder)
+RecorderToPianoRollBridge = safe_import("RecorderToPianoRollBridge", lambda: __import__("recording.recorder_integration", fromlist=["RecorderToPianoRollBridge"]).RecorderToPianoRollBridge)
+TimeGrid = safe_import("TimeGrid", lambda: __import__("playback.time_grid", fromlist=["TimeGrid"]).TimeGrid)
+PlaybackEngine = safe_import("PlaybackEngine", lambda: __import__("playback.playback_engine", fromlist=["PlaybackEngine"]).PlaybackEngine)
+PitchMapper = safe_import("PitchMapper", lambda: __import__("mapping.pitch_mapper", fromlist=["PitchMapper"]).PitchMapper)
+
+KeySelectDialog = safe_import("KeySelectDialog", lambda: __import__("ui.widgets.key_select_dialog", fromlist=["KeySelectDialog"]).KeySelectDialog)
 
 
 def _safe_register(name, cls):
     try:
         F.register(name, cls=cls)
+        print(f"DEBUG: Registered widget {name}")
     except Exception as e:
-        Logger.debug(f"Factory.register('{name}') skipped (likely already registered): {e}")
+        print(f"WARNING: Failed to register {name}:", e)
 
 
 class AuraBeatApp(App):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        print("DEBUG: AuraBeatApp __init__")
+
         self.controller = None
         self.audio_engine = None
 
+        self.recorder = None
+        self.pitch_mapper = None
+        self.time_grid = None
+        self.piano_roll = None
+        self.playback = None
+        self.bridge = None
+
+        self.expanded_popup = None
+        self.is_muted = False
+        self.is_playing_back = False
+
     def build(self):
-        # Register widgets for KV lookups
+        print("DEBUG: build() started")
+
         _safe_register("RootView", RootView)
         _safe_register("VideoFeed", VideoFeed)
         _safe_register("CircleButton", CircleButton)
@@ -80,63 +101,41 @@ class AuraBeatApp(App):
         _safe_register("PianoRollPanel", PianoRollPanel)
         _safe_register("AirOverlayPanel", AirOverlayPanel)
 
-        # Load KV templates/rules
         try:
             Builder.load_string(KV)
+            print("DEBUG: KV loaded successfully")
         except Exception as e:
-            Logger.exception("Failed to load KV — check for syntax errors or missing properties.")
+            print("ERROR: KV load failed:", e)
             raise
 
-        # IMPORTANT: instantiate the root widget explicitly
         root = RootView()
+        print("DEBUG: RootView created")
 
-        # Fullscreen pref
-        try:
-            Window.fullscreen = 'auto'
-        except Exception as e:
-            Logger.warning(f"Could not set fullscreen mode: {e}")
-
-        # Validate required ids exist on the instantiated root
-        required_ids = ["video", "overlay"]
+        required_ids = ["video", "overlay", "pianoroll"]
+        for rid in required_ids:
+            print("DEBUG: Checking id:", rid)
         missing = [w for w in required_ids if w not in root.ids]
         if missing:
-            msg = (
-                "The following required widget ids are missing in your KV: "
-                f"{', '.join(missing)}.\n"
-                "Ensure your <RootView> rule defines:\n"
-                "    id: video    (VideoFeed)\n"
-                "    id: overlay  (AirOverlayPanel)\n"
-            )
-            Logger.critical(msg)
-            raise RuntimeError(msg)
+            print("ERROR: Missing required ids:", missing)
+            raise RuntimeError("Missing required ids")
 
-        # --- Start AudioEngine (keyboard voice) ---
-        if AudioEngine is not None:
+        # Audio engine
+        if AudioEngine:
             try:
-                # Defaults are fine for first sound; adjust sr/buffer later if needed
                 self.audio_engine = AudioEngine(sr=48000, buffersize=256)
                 self.audio_engine.start()
-                Logger.info("AudioEngine started (keyboard voice).")
+                print("DEBUG: AudioEngine started")
             except Exception as e:
-                Logger.exception(f"Failed to start AudioEngine: {e}")
-                self.audio_engine = None
-        else:
-            Logger.warning("AudioEngine class not available; audio disabled.")
+                print("ERROR: AudioEngine failed:", e)
 
-        # Build optional subsystems
+        # Hand tracker
         tracker = None
-        model_path = None
-        if HandTracker is not None:
+        if HandTracker:
             try:
-                # Model path relative to this file's folder (src/)
                 base_dir = os.path.dirname(os.path.abspath(__file__))
                 model_path = os.path.join(base_dir, "models", "hand_landmarker.task")
-                if not os.path.exists(model_path):
-                    Logger.warning(
-                        f"Hand model not found at '{model_path}'. "
-                        "Place 'hand_landmarker.task' there to enable hand tracking."
-                    )
-                else:
+                print("DEBUG: Hand model path:", model_path)
+                if os.path.exists(model_path):
                     tracker = HandTracker(
                         max_hands=2,
                         detection_confidence=0.7,
@@ -145,96 +144,228 @@ class AuraBeatApp(App):
                         model_asset_path=model_path,
                         running_mode="VIDEO",
                     )
+                    print("DEBUG: HandTracker initialized")
             except Exception as e:
-                Logger.exception(f"Failed to initialize HandTracker: {e}")
-                tracker = None
+                print("ERROR: HandTracker failed:", e)
 
+        # Scale window
         scale = None
-        if ScaleWindow is not None:
+        if ScaleWindow:
             try:
                 scale = ScaleWindow.create_c_major()
+                print("DEBUG: ScaleWindow created")
             except Exception as e:
-                Logger.exception(f"Failed to construct ScaleWindow C major: {e}")
-                scale = None
+                print("ERROR: ScaleWindow failed:", e)
 
-        # Controller: video + overlay updates (don’t block app if it fails)
-        if VideoController is not None:
+        # DAW subsystem
+        if PitchMapper and Recorder and TimeGrid and PlaybackEngine and RecorderToPianoRollBridge:
+            try:
+                self.pitch_mapper = PitchMapper(scale)
+                self.recorder = Recorder(self.pitch_mapper)
+                self.time_grid = TimeGrid(pixels_per_second=120)
+                self.piano_roll = root.ids["pianoroll"]
+                self.piano_roll.time_grid = self.time_grid
+
+                print("DEBUG: PianoRollPanel instance:", self.piano_roll)
+
+                self.playback = PlaybackEngine(
+                    time_grid=self.time_grid,
+                    note_canvas=self.piano_roll.note_canvas,
+                    scroll_view=self.piano_roll.scroll,
+                    audio_interface=self.audio_engine,
+                )
+
+                print("DEBUG: PlaybackEngine initialized")
+
+                self.bridge = RecorderToPianoRollBridge(
+                    recorder=self.recorder,
+                    piano_roll=self.piano_roll,
+                    time_grid=self.time_grid,
+                    pitch_mapper=self.pitch_mapper
+                )
+                print("DEBUG: RecorderToPianoRollBridge initialized")
+            except Exception as e:
+                print("ERROR: DAW subsystem failed:", e)
+
+        # Video controller
+        if VideoController:
             try:
                 self.controller = VideoController(
-                    video_widget=root.ids.get("video"),
-                    overlay_widget=root.ids.get("overlay"),
+                    video_widget=root.ids["video"],
+                    overlay_widget=root.ids["overlay"],
                     hand_tracker=tracker,
                     scale=scale,
                     audio_engine=self.audio_engine,
                     cam_index=0,
                 )
-                Clock.schedule_once(lambda dt: self._start_controller_safe(), 0)
-            except Exception as e:
-                Logger.exception(f"Failed to initialize VideoController: {e}")
-                self.controller = None
-        else:
-            Logger.warning("VideoController not available; skipping camera startup.")
+                print("DEBUG: VideoController created")
 
-        # Key bindings
+                if self.controller:
+                    self.controller.recorder = self.recorder
+                    self.controller.pitch_mapper = self.pitch_mapper
+                    Clock.schedule_once(lambda dt: self._start_controller_safe(), 0)
+                    print("DEBUG: VideoController scheduled to start")
+            except Exception as e:
+                print("ERROR: VideoController failed:", e)
+
         Window.bind(on_key_down=self._on_key_down)
+        print("DEBUG: Window.bind(on_key_down) attached")
+
+        print("DEBUG: build() completed")
         return root
 
     def _start_controller_safe(self):
-        if self.controller is None:
-            Logger.warning("Controller is None; skipping start.")
-            return
         try:
-            self.controller.start()
-            Logger.info("VideoController started.")
+            if self.controller:
+                self.controller.start()
+                print("DEBUG: VideoController started")
         except Exception as e:
-            Logger.exception(f"VideoController.start() failed: {e}")
+            print("ERROR: VideoController.start() failed:", e)
 
+    # ============================================================
+    # KEY HANDLER
+    # ============================================================
     def _on_key_down(self, window, key, scancode, codepoint, modifiers):
+        print(f"DEBUG: key_down fired: key={key}, codepoint={codepoint}, mods={modifiers}")
+
         try:
-            # F11 toggles fullscreen
             if key == 293:
+                print("DEBUG: F11 detected")
                 Window.fullscreen = False if Window.fullscreen else 'auto'
                 return True
-            # ESC exits fullscreen
+
             if key == 27 and Window.fullscreen:
+                print("DEBUG: ESC fullscreen exit")
                 Window.fullscreen = False
                 return True
-            # OPTIONAL: Panic audio with 'P'
-            if (codepoint and codepoint.lower() == 'p') and self.audio_engine:
-                try:
+
+            if codepoint and codepoint.lower() == 'p':
+                print("DEBUG: Panic key detected")
+                if self.audio_engine:
                     self.audio_engine.panic()
-                    Logger.info("AudioEngine panic (all notes off).")
-                    return True
-                except Exception as e:
-                    Logger.debug(f"Panic failed: {e}")
+                return True
+
+            if key in (70, 102) or (codepoint and codepoint.lower() == 'f'):
+                print("DEBUG: F key detected")
+                if ExpandedPianoRollPopup:
+                    if self.expanded_popup is None:
+                        print("DEBUG: Creating popup instance")
+                        self.expanded_popup = ExpandedPianoRollPopup(
+                            piano_roll=self.piano_roll,
+                            time_grid=self.time_grid,
+                            pitch_mapper=self.pitch_mapper
+                        )
+                        print("DEBUG: Calling popup.open()")
+                        self.expanded_popup.open()
+                    else:
+                        print("DEBUG: Closing popup")
+                        self.expanded_popup.dismiss()
+                        self.expanded_popup = None
+                else:
+                    print("ERROR: ExpandedPianoRollPopup is None")
+                return True
+
         except Exception as e:
-            Logger.debug(f"Key handling error: {e}")
+            print("ERROR in _on_key_down:", e)
+
         return False
 
-    def toggle_quick_menu(self):
-        try:
-            qm = self.root.ids.get("quickmenu") if self.root else None
-            if qm is None:
-                Logger.warning("QuickMenu id not found (quickmenu).")
+    # ============================================================
+    # Mute toggle
+    # ============================================================
+    def set_muted(self, is_muted: bool):
+        self.is_muted = bool(is_muted)
+        if self.controller:
+            self.controller.muted = self.is_muted
+        print(f"DEBUG: Mute {'ON' if is_muted else 'OFF'}")
+
+    # ============================================================
+    # Record toggle
+    # ============================================================
+    def toggle_record(self):
+        if not self.recorder or not self.bridge:
+            print("Recorder or bridge not initialized")
+            return
+
+        if not getattr(self.recorder, "is_recording", False):
+            # Clear previous notes before starting new recording
+            if self.piano_roll:
+                self.piano_roll.note_canvas.notes = []
+            self.recorder.start()
+            print("Recording started")
+        else:
+            self.recorder.stop()
+            print("Recording stopped")
+            try:
+                self.bridge.apply_recorded_events()
+            except Exception as e:
+                print("Failed to apply recorded events:", e)
+
+    # ============================================================
+    # Playback toggle
+    # ============================================================
+    def toggle_playback(self):
+        if not self.playback:
+            print("Playback not initialized")
+            return
+
+        if self.playback.is_playing:
+            self.playback.stop()
+            self.is_playing_back = False
+            if self.controller:
+                self.controller.muted = False
+            print("Playback stopped")
+        else:
+            if not self.piano_roll or not self.piano_roll.note_canvas.notes:
+                print("No notes to play back")
                 return
-            qm.visible = not getattr(qm, "visible", False)
-        except Exception as e:
-            Logger.exception(f"toggle_quick_menu failed: {e}")
+            if self.controller:
+                self.controller.muted = True
+            self.is_playing_back = True
+            self.playback.stop()
+            self.playback.play()
+            print("Playback started")
+            Clock.schedule_interval(self._check_playback_done, 0.1)
 
-    def on_stop(self):
+    def _check_playback_done(self, dt):
+        if not self.playback or not self.playback.is_playing:
+            self.is_playing_back = False
+            if self.controller:
+                self.controller.muted = False
+            print("Playback finished")
+            return False
+
+    # ============================================================
+    # Open finger → key mapping dialog
+    # ============================================================
+    def open_finger_mapping_dialog(self, hand, finger):
+        print(f"DEBUG: Opening KeySelectDialog for {hand} {finger}")
+
+        if not KeySelectDialog:
+            print("ERROR: KeySelectDialog class not available")
+            return
 
         try:
-            if getattr(self, "controller", None):
-                self.controller.stop()
+            dlg = KeySelectDialog(
+                hand=hand,
+                finger=finger,
+                pitch_mapper=self.pitch_mapper,
+                on_apply=lambda: self._after_mapping_change()
+            )
+            dlg.open()
         except Exception as e:
-            Logger.debug(f"Issue stopping controller on app shutdown: {e}")
+            print("ERROR: Failed to open KeySelectDialog:", e)
 
+    def _after_mapping_change(self):
+        print("DEBUG: Mapping changed → refreshing overlay labels")
         try:
-            if getattr(self, "audio_engine", None):
-                self.audio_engine.stop()
+            overlay = self.root.ids.get("overlay")
+            if overlay:
+                overlay.refresh_labels()
         except Exception as e:
-            Logger.debug(f"Issue stopping audio engine on app shutdown: {e}")
+            print("ERROR: Failed to refresh overlay labels:", e)
 
 
 if __name__ == "__main__":
+    print("DEBUG: Running AuraBeatApp")
     AuraBeatApp().run()

@@ -1,180 +1,142 @@
 # src/gestures/finger_press.py
-"""
-Threshold-plane finger press detector.
-
-For fingers (Index–Pinky):
-    "Pressed" when the fingertip crosses below the knuckle line.
-    The knuckle line is defined by the MCP row (landmarks 5, 9, 13, 17),
-    projected onto the palm's down-axis in normalized 2D image space.
-
-For the thumb:
-    "Pressed" when the thumb tip curls laterally past the index MCP (landmark 5),
-    measured along the palm's lateral axis in normalized 2D image space.
-
-All distances are normalized by palm size (wrist → middle MCP) so the
-detector is scale-invariant. A small margin and frame debounce prevent
-single-frame flickers on the crossing boundary.
-"""
-
 from collections import deque
-from typing import Literal
 import numpy as np
-from mapping.finger_ids import WRIST
 
+# ── MediaPipe landmark indices ──────────────────────────────────────────────
+WRIST       = 0
+THUMB_CMC   = 1   # base of thumb
+THUMB_MCP   = 2
+THUMB_IP    = 3
+THUMB_TIP   = 4
 
-# ---------- Landmark helpers ----------
+INDEX_MCP   = 5;  INDEX_TIP  = 8
+MIDDLE_MCP  = 9;  MIDDLE_TIP = 12
+RING_MCP    = 13; RING_TIP   = 16
+PINKY_MCP   = 17; PINKY_TIP  = 20
+
 
 def _pt(lm, idx) -> np.ndarray:
     return np.array([lm[idx].x, lm[idx].y], dtype=np.float32)
 
 
-def _palm_size(lm) -> float:
-    """Wrist → middle MCP distance (landmark 9). Used to normalize all distances."""
-    return float(max(1e-6, np.linalg.norm(_pt(lm, 9) - _pt(lm, WRIST))))
-
-
-def _palm_down_axis(lm) -> np.ndarray:
+def _knuckle_line_normal(lm) -> tuple[np.ndarray, np.ndarray]:
     """
-    Unit vector pointing from the knuckle row toward the wrist (i.e. 'downward'
-    relative to the palm). Fingers curl in this direction when pressing.
-
-    Knuckle row centroid: average of MCP landmarks 5, 9, 13, 17.
+    Returns (point_on_line, unit_normal) for the knuckle line.
+    The line runs through MCP joints 5-9-13-17.
+    Normal points from knuckle line TOWARD fingertips (away from palm).
     """
-    mcps = np.mean([_pt(lm, i) for i in (5, 9, 13, 17)], axis=0)
+    p5  = _pt(lm, INDEX_MCP)
+    p17 = _pt(lm, PINKY_MCP)
+
+    # Direction along the knuckle line (index → pinky)
+    line_dir = p17 - p5
+    length = np.linalg.norm(line_dir)
+    if length < 1e-6:
+        line_dir = np.array([1.0, 0.0], dtype=np.float32)
+    else:
+        line_dir /= length
+
+    # Perpendicular (rotate 90°): two candidates
+    perp = np.array([-line_dir[1], line_dir[0]], dtype=np.float32)
+
+    # Make sure the normal points TOWARD fingertips (away from wrist)
     wrist = _pt(lm, WRIST)
-    v = wrist - mcps
-    n = np.linalg.norm(v)
-    return v / n if n > 1e-6 else np.array([0.0, 1.0], dtype=np.float32)
+    mid_knuckle = _pt(lm, MIDDLE_MCP)
+    wrist_to_knuckle = mid_knuckle - wrist
+    if np.dot(perp, wrist_to_knuckle) < 0:
+        perp = -perp
+
+    return p5, perp  # anchor point, unit normal pointing toward fingertips
 
 
-def _palm_lateral_axis(lm) -> np.ndarray:
+def _signed_dist_from_knuckle_line(lm, tip_idx: int) -> float:
     """
-    Unit vector pointing from pinky MCP (17) toward index MCP (5).
-    Used as the thumb's crossing axis (lateral curl toward index side).
+    Positive = tip is on the FINGERTIP side of the knuckle line (extended).
+    Negative = tip has crossed to the PALM side (pressed).
     """
-    v = _pt(lm, 5) - _pt(lm, 17)
-    n = np.linalg.norm(v)
-    return v / n if n > 1e-6 else np.array([1.0, 0.0], dtype=np.float32)
+    anchor, normal = _knuckle_line_normal(lm)
+    tip = _pt(lm, tip_idx)
+    return float(np.dot(tip - anchor, normal))
 
 
-def _knuckle_line_offset(lm, down_axis: np.ndarray) -> float:
+def _thumb_signed_dist(lm) -> float:
     """
-    Project the knuckle row centroid onto the down_axis.
-    This is the baseline value that fingertips are compared against.
+    Thumb uses a separate axis: CMC(1) → Index MCP(5).
+    Positive = thumb tip is on the 'open' side, negative = crossed inward.
     """
-    mcps = np.mean([_pt(lm, i) for i in (5, 9, 13, 17)], axis=0)
-    return float(np.dot(mcps, down_axis))
+    cmc = _pt(lm, THUMB_CMC)
+    idx_mcp = _pt(lm, INDEX_MCP)
 
+    axis = idx_mcp - cmc
+    length = np.linalg.norm(axis)
+    if length < 1e-6:
+        return 0.0
+    axis /= length
 
-def _tip_offset(lm, tip_id: int, axis: np.ndarray) -> float:
-    """Project a fingertip onto the given axis."""
-    return float(np.dot(_pt(lm, tip_id), axis))
+    # Normal perpendicular to thumb axis, pointing away from palm
+    perp = np.array([-axis[1], axis[0]], dtype=np.float32)
+    wrist = _pt(lm, WRIST)
+    if np.dot(perp, idx_mcp - wrist) < 0:
+        perp = -perp
 
+    tip = _pt(lm, THUMB_TIP)
+    return float(np.dot(tip - cmc, perp))
 
-# ---------- Detector ----------
 
 class FingerPress:
     """
-    Single-finger threshold-plane press detector.
+    Detects press/release by checking whether a fingertip has crossed
+    the knuckle line (or thumb axis) into palm territory.
 
-    Parameters
-    ----------
-    tip_id : int
-        MediaPipe landmark index of the fingertip.
-    pip_id : int
-        MediaPipe landmark index of the PIP joint (unused in threshold logic,
-        kept for API compatibility with camera.py).
-    is_thumb : bool
-        If True, uses the lateral-curl axis instead of the down axis.
-    margin : float
-        Crossing margin as a fraction of palm size. Fingertip must exceed
-        the knuckle line by this amount to count as pressed.
-    thumb_margin : float
-        Same concept for the thumb's lateral axis.
-    debounce_on : int
-        Consecutive frames the tip must be past the line before firing "on".
-    debounce_off : int
-        Consecutive frames the tip must be back before firing "off".
+    Returns "on" when the tip crosses inward past the threshold,
+    and "off" when it crosses back out — giving natural note hold.
     """
 
-    def __init__(
-        self,
-        tip_id: int,
-        pip_id: int,
-        is_thumb: bool = False,
-        margin: float = 0.08,
-        thumb_margin: float = 0.10,
-        debounce_on: int = 2,
-        debounce_off: int = 3,
-    ):
-        self.tip = tip_id
-        self.pip = pip_id                  # kept for API compat
-        self.is_thumb = is_thumb
-        self.margin = margin
-        self.thumb_margin = thumb_margin
-        self._deb_on = debounce_on
-        self._deb_off = debounce_off
+    # How far PAST the knuckle line (in normalized coords) before triggering.
+    # Negative = into the palm. Tweak if too sensitive or not sensitive enough.
+    PRESS_THRESHOLD  = 0.0   # cross this to trigger ON
+    RELEASE_THRESHOLD = 0.0   # cross back this far to trigger OFF
 
-        self.state: Literal["up", "down"] = "up"
-        self._on_count = 0
-        self._off_count = 0
+    # Smoothing window to reduce jitter
+    SMOOTH_FRAMES = 1
+
+    def __init__(self, tip_id: int, pip_id: int, history: int = 6):
+        self.tip_id = tip_id
+        self.is_thumb = (tip_id == THUMB_TIP)
+        self._dist_buf: deque[float] = deque(maxlen=self.SMOOTH_FRAMES)
+        self.state = "idle"   # "idle" | "pressed"
+
+    def _get_dist(self, lm) -> float:
+        if self.is_thumb:
+            return _thumb_signed_dist(lm)
+        return _signed_dist_from_knuckle_line(lm, self.tip_id)
 
     def update(self, lm) -> str | None:
         """
-        Call once per frame with the full landmark list for one hand.
-
-        Returns
-        -------
-        "on"  – fingertip just crossed the line (note start)
-        "off" – fingertip just uncrossed the line (note end)
-        None  – no state change this frame
+        Call every frame with hand.landmark list.
+        Returns "on", "off", or None.
         """
-        palm = _palm_size(lm)
+        raw = self._get_dist(lm)
+        self._dist_buf.append(raw)
 
-        if self.is_thumb:
-            # Thumb: lateral curl toward index side
-            lat = _palm_lateral_axis(lm)
+        # Smoothed distance
+        dist = float(np.mean(self._dist_buf))
 
-            # Reference: index MCP (5) projected onto lateral axis
-            ref = float(np.dot(_pt(lm, 5), lat))
-
-            # Thumb tip projected onto the same axis
-            tip_proj = _tip_offset(lm, self.tip, lat)
-
-            # Thumb MCP (2) gives a natural zero-crossing anchor;
-            # how far past the index MCP has the tip curled?
-            crossed = (ref - tip_proj) / palm > self.thumb_margin
-
-        else:
-            # Fingers: downward curl past the knuckle line
-            down = _palm_down_axis(lm)
-            knuckle_proj = _knuckle_line_offset(lm, down)
-            tip_proj = _tip_offset(lm, self.tip, down)
-
-            # Tip is "below" the knuckle line when its down-axis projection
-            # exceeds the knuckle centroid projection by more than margin*palm.
-            crossed = (tip_proj - knuckle_proj) / palm > self.margin
-
-        return self._debounce(crossed)
-
-    def _debounce(self, crossed: bool) -> str | None:
-        """
-        Two independent counters (on / off) prevent single-frame flickers
-        at the crossing boundary.
-        """
         ev = None
 
-        if crossed:
-            self._on_count += 1
-            self._off_count = 0
-            if self.state == "up" and self._on_count >= self._deb_on:
-                self.state = "down"
+        if self.state == "idle":
+            if dist < self.PRESS_THRESHOLD:
+                self.state = "pressed"
                 ev = "on"
-        else:
-            self._off_count += 1
-            self._on_count = 0
-            if self.state == "down" and self._off_count >= self._deb_off:
-                self.state = "up"
+
+        elif self.state == "pressed":
+            if dist > self.RELEASE_THRESHOLD:
+                self.state = "idle"
                 ev = "off"
 
         return ev
+
+    def reset(self):
+        """Call this if the hand disappears mid-note."""
+        self.state = "idle"
+        self._dist_buf.clear()

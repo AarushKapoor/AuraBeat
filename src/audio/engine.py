@@ -26,7 +26,7 @@ class AudioEngine:
         self.server = None
         self.master = None
         self.voices: Dict[str, KeyboardVoice] = {}
-        self.staccato_mode = True
+        self.staccato_mode = False
         self.staccato_ms = 120
         self._on_times = {}
         self._timers = {}

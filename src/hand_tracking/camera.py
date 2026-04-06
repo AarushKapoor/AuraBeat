@@ -21,31 +21,8 @@ from mapping.finger_ids import (
 
 from mapping.scale_window import midi_to_name
 
-THUMB_TIP = 4
-
 
 class VideoController:
-    """
-    Webcam -> (optional) hand tracking -> video widget + overlay widget.
-
-    Preserves your:
-      - whole-hand gestures (fist/thumb) for scale window shifts
-      - per-finger press detection -> note on/off
-      - overlay.update_model(ll, lp, rl, rp, lf, lt, rf, rt,
-                             left_present=..., right_present=...)
-
-    Adds:
-      - Windows backend selection + MJPG (often better FPS)
-      - Attempts 1280x720, then 1920x1080 16:9; otherwise center-crops to 16:9
-      - Low-latency buffer where supported
-      - Mild FPS pacing to avoid pegging a CPU core
-      - PERMANENT note labels pushed every frame from current scale blocks
-      - Hand presence "green dots" now reflect a debounced **hand-up** state:
-          hand-up := (hand detected AND NOT is_fist(hand))
-      - Persistent pressed state: notes hold as long as finger stays past the
-          threshold line, not just for the single frame the "on" event fires.
-    """
-
     def __init__(
         self,
         video_widget: Any,
@@ -61,10 +38,11 @@ class VideoController:
         self.tracker = hand_tracker
         self.scale = scale
         self.audio_engine = audio_engine
+        self.recorder = None
+        self.pitch_mapper = None
+        self.muted = False
 
-        # --- Prefer a backend that allows mode selection (esp. on Windows) ---
         if sys.platform.startswith("win"):
-            # CAP_DSHOW tends to allow MJPG selection + decent latency
             self.cam = cv2.VideoCapture(cam_index, cv2.CAP_DSHOW)
         else:
             self.cam = cv2.VideoCapture(cam_index)
@@ -72,13 +50,11 @@ class VideoController:
         if not self.cam.isOpened():
             raise RuntimeError(f"Could not open webcam (index {cam_index}).")
 
-        # Reduce latency if backend supports it
         try:
             self.cam.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         except Exception:
             pass
 
-        # On Windows, MJPG often enables 1280x720/1920x1080 at usable FPS.
         try:
             if sys.platform.startswith("win"):
                 fourcc = cv2.VideoWriter_fourcc(*"MJPG")
@@ -86,7 +62,6 @@ class VideoController:
         except Exception:
             pass
 
-        # --- Try to request 16:9 capture (720p, then 1080p) ---
         def _try_mode(w: int, h: int) -> bool:
             ok1 = self.cam.set(cv2.CAP_PROP_FRAME_WIDTH, float(w))
             ok2 = self.cam.set(cv2.CAP_PROP_FRAME_HEIGHT, float(h))
@@ -99,48 +74,35 @@ class VideoController:
                 ok, frame = self.cam.read()
                 if ok and frame is not None and frame.size > 0:
                     hh, ww = frame.shape[:2]
-                    # Confirm ~16:9 within 2% tolerance
                     if abs((ww / float(hh)) - (16 / 9)) < 0.02:
                         applied_mode = (ww, hh)
                         break
 
-        # If not confirmed 16:9, we'll crop on the fly in the loop.
         self._crop_to_16x9 = applied_mode is None
 
         self.running = False
         self._ts0: Optional[float] = None
         self._last_good_frame: Optional[np.ndarray] = None
 
-        # whole-hand hysteresis (gestures)
         self.fist_L = HysteresisFlag();  self.thumb_L = HysteresisFlag()
         self.fist_R = HysteresisFlag();  self.thumb_R = HysteresisFlag()
         self._lf_prev = self._lt_prev = self._rf_prev = self._rt_prev = False
 
-        # finger press detectors (per-hand), thumb flagged for lateral-curl axis
-        self.det_left = {
-            tip: FingerPress(tip, TIP_TO_PIP[tip], is_thumb=(tip == THUMB_TIP))
-            for tip in TIP_TO_PIP.keys()
-        }
-        self.det_right = {
-            tip: FingerPress(tip, TIP_TO_PIP[tip], is_thumb=(tip == THUMB_TIP))
-            for tip in TIP_TO_PIP.keys()
-        }
+        self.det_left  = {tip: FingerPress(tip, TIP_TO_PIP[tip]) for tip in TIP_TO_PIP.keys()}
+        self.det_right = {tip: FingerPress(tip, TIP_TO_PIP[tip]) for tip in TIP_TO_PIP.keys()}
 
-        # Persistent pressed state — updated only on "on"/"off" events so that
-        # notes hold for as long as the finger stays past the threshold line.
-        _finger_names = ["Thumb", "Index", "Middle", "Ring", "Pinky"]
-        self._pressed_left  = {n: False for n in _finger_names}
-        self._pressed_right = {n: False for n in _finger_names}
-
-        # presence (hand-up) debounce state
+        # presence debounce
         self._up_left = False
         self._up_right = False
         self._upL_on = 0; self._upL_off = 0
         self._upR_on = 0; self._upR_off = 0
-        self._PRES_ON_FRAMES = 2       # require N consecutive frames to turn ON
-        self._PRES_OFF_FRAMES = 3      # require M consecutive frames to turn OFF
+        self._PRES_ON_FRAMES = 2
+        self._PRES_OFF_FRAMES = 3
 
-        # pacing
+        # persistent pressed state (held across frames)
+        self._held_left  = {n: False for n in ["Thumb", "Index", "Middle", "Ring", "Pinky"]}
+        self._held_right = {n: False for n in ["Thumb", "Index", "Middle", "Ring", "Pinky"]}
+
         self._target_dt = 1.0 / float(max(1.0, target_fps))
         self._thread: Optional[threading.Thread] = None
 
@@ -213,7 +175,6 @@ class VideoController:
 
     @staticmethod
     def _center_crop_16x9(frame_bgr: np.ndarray) -> np.ndarray:
-        """Center-crop any frame to the largest 16:9 region that fits."""
         h, w = frame_bgr.shape[:2]
         target_ratio = 16.0 / 9.0
         cur_ratio = w / float(h)
@@ -233,7 +194,6 @@ class VideoController:
     def _loop(self):
         next_tick = time.perf_counter()
         while self.running:
-            # Mild pacing to avoid 100% CPU
             now = time.perf_counter()
             if now < next_tick:
                 time.sleep(max(0.0, next_tick - now))
@@ -248,7 +208,6 @@ class VideoController:
             else:
                 self._last_good_frame = frame
 
-            # Force 16:9 if needed
             if self._crop_to_16x9:
                 try:
                     frame = self._center_crop_16x9(frame)
@@ -270,7 +229,6 @@ class VideoController:
                 except Exception:
                     annotated = frame
 
-            # video -> UI (convert BGR->RGB and mirror for UI)
             try:
                 rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
                 rgb = cv2.flip(rgb, 1)
@@ -285,40 +243,36 @@ class VideoController:
 
             Clock.schedule_once(lambda dt, im=rgb: self.video_widget.set_frame(im))
 
-            # ---- Overlay state prep ------------------------------------------
-
+            # ---- Overlay state prep ----
             left_labels  = {n: "—" for n in ["Thumb", "Index", "Middle", "Ring", "Pinky"]}
             right_labels = {n: "—" for n in ["Thumb", "Index", "Middle", "Ring", "Pinky"]}
-
-            # Seed pressed state from persistent store so held notes stay lit
-            # in the overlay even on frames where no new event fires.
-            left_pressed  = dict(self._pressed_left)
-            right_pressed = dict(self._pressed_right)
-
+            left_pressed  = dict(self._held_left)
+            right_pressed = dict(self._held_right)
             left_fist = left_thumb = right_fist = right_thumb = False
 
-            # PERMANENT NOTE LABELS: always compute from scale blocks
             has_scale = self.scale is not None
             if has_scale:
                 try:
                     left_block  = self.scale.left_block()
                     right_block = self.scale.right_block()
-                    left_names  = [midi_to_name(m) for m in (left_block or [])]
-                    right_names = [midi_to_name(m) for m in (right_block or [])]
-                    fingers = ["Thumb", "Index", "Middle", "Ring", "Pinky"]
-                    for i, nm in enumerate(fingers):
-                        if i < len(left_names):
-                            left_labels[nm] = left_names[i]
-                        if i < len(right_names):
-                            right_labels[nm] = right_names[i]
+                    if self.pitch_mapper:
+                        for nm in ["Thumb", "Index", "Middle", "Ring", "Pinky"]:
+                            try:
+                                midi = self.pitch_mapper.get_pitch("left", nm)
+                                left_labels[nm] = midi_to_name(midi) if midi is not None else "—"
+                            except Exception:
+                                pass
+                            try:
+                                midi = self.pitch_mapper.get_pitch("right", nm)
+                                right_labels[nm] = midi_to_name(midi) if midi is not None else "—"
+                            except Exception:
+                                pass
                 except Exception:
                     pass
 
-            # Raw "hand-up" booleans for this frame (before debounce)
             raw_up_left  = False
             raw_up_right = False
 
-            # Handedness extraction
             handed = []
             if meta is not None and hasattr(meta, "handedness") and meta.handedness is not None:
                 try:
@@ -336,12 +290,10 @@ class VideoController:
                 except Exception:
                     handed = []
 
-            # ---- Per-hand processing ----------------------------------------
             if results is not None and hasattr(results, "multi_hand_landmarks") and results.multi_hand_landmarks:
                 for i, hand in enumerate(results.multi_hand_landmarks):
                     side = handed[i] if i < len(handed) else ("Right" if i == 0 else "Left")
 
-                    # Whole-hand gestures
                     try:
                         fnow = is_fist(hand)
                         tnow = is_thumbs_up(hand)
@@ -349,7 +301,6 @@ class VideoController:
                         fnow = False
                         tnow = False
 
-                    # hand-up: detected and NOT a fist
                     this_up = not fnow
 
                     if side == "Right":
@@ -383,48 +334,80 @@ class VideoController:
                         block = self.scale.left_block() if has_scale else []
                         order = LEFT_PLAY_ORDER
 
-                    # Refresh labels from current block
-                    if has_scale and block:
-                        try:
-                            names = [midi_to_name(m) for m in block]
-                            lab_map = dict(zip(["Thumb", "Index", "Middle", "Ring", "Pinky"], names))
-                            if side == "Right":
-                                right_labels.update(lab_map)
-                            else:
-                                left_labels.update(lab_map)
-                        except Exception:
-                            pass
+                    if self.pitch_mapper:
+                        for nm in ["Thumb", "Index", "Middle", "Ring", "Pinky"]:
+                            try:
+                                midi = self.pitch_mapper.get_pitch("right" if side == "Right" else "left", nm)
+                                name = midi_to_name(midi) if midi is not None else "—"
+                                if side == "Right":
+                                    right_labels[nm] = name
+                                else:
+                                    left_labels[nm] = name
+                            except Exception:
+                                pass
 
-                    # ---- Per-finger press -> note on/off --------------------
                     try:
-                        dets       = self.det_right       if side == "Right" else self.det_left
-                        pressed_map = right_pressed       if side == "Right" else left_pressed
-                        persist    = self._pressed_right  if side == "Right" else self._pressed_left
-
+                        dets = self.det_right if side == "Right" else self.det_left
+                        pressed_map = right_pressed if side == "Right" else left_pressed
                         if has_scale and block:
                             for idx, tip in enumerate(order):
                                 ev = dets[tip].update(hand.landmark)
                                 fname = TIP_TO_NAME[tip]
-                                midi  = block[idx] if idx < len(block) else None
+                                midi = self.pitch_mapper.get_pitch("right" if side == "Right" else "left", fname)
                                 if midi is None:
                                     continue
 
                                 tag = f"{'R' if side == 'Right' else 'L'}-{fname}"
 
                                 if ev == "on":
-                                    self._note_on(midi, 100, tag=tag)
-                                    # Update both the per-frame map and the
-                                    # persistent store so the note holds.
+                                    if not self.muted:
+                                        self._note_on(midi, 100, tag=tag)
                                     pressed_map[fname] = True
-                                    persist[fname]     = True
+                                    if side == "Right":
+                                        self._held_right[fname] = True
+                                    else:
+                                        self._held_left[fname] = True
+                                    if self.recorder:
+                                        self.recorder.update(side, fname, True)
+
                                 elif ev == "off":
-                                    self._note_off(midi, tag=tag)
+                                    if not self.muted:
+                                        self._note_off(midi, tag=tag)
                                     pressed_map[fname] = False
-                                    persist[fname]     = False
+                                    if side == "Right":
+                                        self._held_right[fname] = False
+                                    else:
+                                        self._held_left[fname] = False
+                                    if self.recorder:
+                                        self.recorder.update(side, fname, False)
+
                     except Exception:
                         pass
 
-            # ---- Debounce hand-up presence ----------------------------------
+            # Reset detectors for any hand that's no longer present
+            if not raw_up_left:
+                for det in self.det_left.values():
+                    det.reset()
+                for fname, held in self._held_left.items():
+                    if held:
+                        tag = f"L-{fname}"
+                        midi = self.pitch_mapper.get_pitch("left", fname) if self.pitch_mapper else None
+                        if midi is not None:
+                            self._note_off(midi, tag=tag)
+                self._held_left = {n: False for n in self._held_left}
+
+            if not raw_up_right:
+                for det in self.det_right.values():
+                    det.reset()
+                for fname, held in self._held_right.items():
+                    if held:
+                        tag = f"R-{fname}"
+                        midi = self.pitch_mapper.get_pitch("right", fname) if self.pitch_mapper else None
+                        if midi is not None:
+                            self._note_off(midi, tag=tag)
+                self._held_right = {n: False for n in self._held_right}
+
+            # ---- Debounce "hand-up" presence ----
             if raw_up_left:
                 self._upL_on += 1; self._upL_off = 0
                 if self._upL_on >= self._PRES_ON_FRAMES:
@@ -443,13 +426,12 @@ class VideoController:
                 if self._upR_off >= self._PRES_OFF_FRAMES:
                     self._up_right = False
 
-            # ---- Push overlay -----------------------------------------------
             if hasattr(self.overlay, "update_model"):
                 def _push_overlay(dt,
-                                  ll=left_labels,  lp=left_pressed,
+                                  ll=left_labels, lp=left_pressed,
                                   rl=right_labels, rp=right_pressed,
-                                  lf=left_fist,    lt=left_thumb,
-                                  rf=right_fist,   rt=right_thumb,
+                                  lf=left_fist, lt=left_thumb,
+                                  rf=right_fist, rt=right_thumb,
                                   lhp=self._up_left, rhp=self._up_right):
                     try:
                         self.overlay.update_model(ll, lp, rl, rp, lf, lt, rf, rt,
