@@ -21,7 +21,7 @@ class KeyboardVoice:
         master_mul = getattr(self.master, "master_gain", 0.9)
 
         # 1. Amplitude Envelope
-        self._env = pyo.Adsr(attack=0.005, decay=0.5, sustain=0.0, release=0.2)
+        self._env = pyo.Adsr(attack=0.005, decay=0.1, sustain=0.8, release=0.3)
 
         # 2. Richer Oscillator: SuperSaw (Built-in detuned saw waves)
         self._osc = pyo.SuperSaw(freq=self.freq, detune=0.5, mul=self._env * master_mul)

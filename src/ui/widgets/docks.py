@@ -15,10 +15,6 @@ from .transport_controls import TransportControls
 # UpperDock
 # ---------------------------------------------------------------------
 class UpperDock(Widget):
-    """
-    Floating dock anchored to the TOP.
-    Contains: [Record] [Transport] [Instrument] [Layer]
-    """
     margin_dp = NumericProperty(dp(10))
     spacing_dp = NumericProperty(dp(8))
     pad_dp = ListProperty([dp(8), dp(8), dp(8), dp(8)])
@@ -29,9 +25,6 @@ class UpperDock(Widget):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
-        # ---------------------------------------------------------
-        # Horizontal row container
-        # ---------------------------------------------------------
         self._row = BoxLayout(
             orientation="horizontal",
             spacing=self.spacing_dp,
@@ -42,9 +35,6 @@ class UpperDock(Widget):
         )
         self.add_widget(self._row)
 
-        # ---------------------------------------------------------
-        # Create all slots FIRST (important!)
-        # ---------------------------------------------------------
         self._rec_slot = AnchorLayout(
             anchor_x="left",
             anchor_y="center",
@@ -73,56 +63,44 @@ class UpperDock(Widget):
             width=dp(130)
         )
 
-        # ---------------------------------------------------------
-        # Add slots to the row in correct order
-        # ---------------------------------------------------------
         self._row.add_widget(self._rec_slot)
         self._row.add_widget(self._transport_slot)
         self._row.add_widget(self._inst_slot)
         self._row.add_widget(self._layer_slot)
 
-        # ---------------------------------------------------------
-        # Now create widgets and add them to their slots
-        # ---------------------------------------------------------
-
-        # --- Record button ---
+        # Record button
         self.btn_record = CircleIconButton(size_hint=(None, None))
         self.btn_record.size = (self.record_diameter_dp, self.record_diameter_dp)
         self._rec_slot.add_widget(self.btn_record)
         self.btn_record.bind(on_release=self._on_record_pressed)
 
-        # --- Transport Controls ---
+        # Transport controls
         self.transport = TransportControls()
         self.transport.height = self.pill_height_dp
         self.transport.width = dp(200)
         self._transport_slot.add_widget(self.transport)
 
         app = App.get_running_app()
-
-        self.transport.on_play = lambda: app.playback.play() if app and app.playback else None
-        self.transport.on_pause = lambda: app.playback.pause() if app and app.playback else None
-        self.transport.on_back = lambda: app.playback.stop() if app and app.playback else None
+        self.transport.on_play   = lambda: app.toggle_playback() if app else None
+        self.transport.on_pause  = lambda: app.playback.pause() if app and app.playback else None
+        self.transport.on_back   = lambda: app.playback.stop() if app and app.playback else None
         self.transport.on_forward = lambda: app.playback.stop() if app and app.playback else None
-        self.transport.on_loop = lambda: app.playback.enable_loop(app.playback.current_time + 4)
+        self.transport.on_loop   = lambda: app.playback.enable_loop(app.playback.current_time + 4) if app and app.playback else None
 
-        # --- Instrument button ---
+        # Instrument button
         self.btn_instrument = PillButton(text="Instrument: Piano", size_hint=(None, None))
         self.btn_instrument.height = self.pill_height_dp
         self.btn_instrument.width = self._inst_slot.width
         self._inst_slot.add_widget(self.btn_instrument)
 
-        # --- Layer button ---
+        # Layer button
         self.btn_layer = PillButton(text="Layer: 1", size_hint=(None, None))
         self.btn_layer.height = self.pill_height_dp
         self.btn_layer.width = self._layer_slot.width
         self._layer_slot.add_widget(self.btn_layer)
 
-        # ---------------------------------------------------------
-        # Final layout sync
-        # ---------------------------------------------------------
         self._recompute_row_width()
 
-        # Bindings
         self.bind(
             pos=self._sync, size=self._sync,
             spacing_dp=self._rebuild_layout,
@@ -131,21 +109,14 @@ class UpperDock(Widget):
             record_diameter_dp=self._sync_sizes
         )
 
-    # -------------------------------------------------------------
-    # Layout helpers
-    # -------------------------------------------------------------
     def _sync_sizes(self, *_):
         self._row.height = self.pill_height_dp
-
         self.btn_instrument.height = self.pill_height_dp
         self.btn_layer.height = self.pill_height_dp
-
         self._rec_slot.width = self.record_diameter_dp
         self.btn_record.size = (self.record_diameter_dp, self.record_diameter_dp)
-
         self._inst_slot.width = self.btn_instrument.width
         self._layer_slot.width = self.btn_layer.width
-
         self._recompute_row_width()
 
     def _rebuild_layout(self, *_):
@@ -171,10 +142,7 @@ class UpperDock(Widget):
         app = App.get_running_app()
         if not app:
             return
-
         app.toggle_record()
-
-        # Toggle visual state
         self.btn_record.active = not self.btn_record.active
 
 
@@ -182,10 +150,6 @@ class UpperDock(Widget):
 # LowerDock
 # ---------------------------------------------------------------------
 class LowerDock(Widget):
-    """
-    Floating dock anchored to the BOTTOM.
-    Contains: [Mute] [Controls]
-    """
     margin_dp = NumericProperty(dp(10))
     spacing_dp = NumericProperty(dp(8))
     pad_dp = ListProperty([dp(8), dp(8), dp(8), dp(8)])
@@ -210,10 +174,12 @@ class LowerDock(Widget):
         self._container.add_widget(self._row)
         self.add_widget(self._container)
 
-        # Buttons
+        self._muted = False
+
         self.btn_mute = PillButton(text="Mute", size_hint=(None, None))
         self.btn_mute.height = self.pill_height_dp
         self.btn_mute.width = dp(110)
+        self.btn_mute.bind(on_release=self._on_mute_pressed)
 
         self.btn_controls = PillButton(text="Controls: 10-key mapping", size_hint=(None, None))
         self.btn_controls.height = self.pill_height_dp
@@ -229,6 +195,19 @@ class LowerDock(Widget):
             pad_dp=self._rebuild_layout,
             pill_height_dp=self._sync_sizes
         )
+
+    def _on_mute_pressed(self, *args):
+        app = App.get_running_app()
+        if not app:
+            return
+        self._muted = not self._muted
+        app.set_muted(self._muted)
+        if self._muted:
+            self.btn_mute.text = "Unmute"
+            self.btn_mute.color = (1, 0.3, 0.3, 1)
+        else:
+            self.btn_mute.text = "Mute"
+            self.btn_mute.color = (0.92, 0.95, 1, 1)
 
     def _sync_sizes(self, *_):
         self._container.height = self.pill_height_dp
@@ -256,4 +235,3 @@ class LowerDock(Widget):
         )
         self._container.width = self.width - 2 * self.margin_dp
         self._container.height = self.pill_height_dp
-

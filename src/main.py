@@ -29,7 +29,6 @@ except Exception as e:
     print("ERROR: Failed to import widgets:", e)
     raise
 
-# NEW: expanded piano roll popup
 ExpandedPianoRollPopup = None
 try:
     ExpandedPianoRollPopup = __import__(
@@ -88,6 +87,8 @@ class AuraBeatApp(App):
         self.bridge = None
 
         self.expanded_popup = None
+        self.is_muted = False
+        self.is_playing_back = False
 
     def build(self):
         print("DEBUG: build() started")
@@ -222,35 +223,30 @@ class AuraBeatApp(App):
             print("ERROR: VideoController.start() failed:", e)
 
     # ============================================================
-    # KEY HANDLER (debug version)
+    # KEY HANDLER
     # ============================================================
     def _on_key_down(self, window, key, scancode, codepoint, modifiers):
         print(f"DEBUG: key_down fired: key={key}, codepoint={codepoint}, mods={modifiers}")
 
         try:
-            # F11
             if key == 293:
                 print("DEBUG: F11 detected")
                 Window.fullscreen = False if Window.fullscreen else 'auto'
                 return True
 
-            # ESC exits fullscreen
             if key == 27 and Window.fullscreen:
                 print("DEBUG: ESC fullscreen exit")
                 Window.fullscreen = False
                 return True
 
-            # Panic
             if codepoint and codepoint.lower() == 'p':
                 print("DEBUG: Panic key detected")
                 if self.audio_engine:
                     self.audio_engine.panic()
                 return True
 
-            # F key detection (robust)
             if key in (70, 102) or (codepoint and codepoint.lower() == 'f'):
                 print("DEBUG: F key detected")
-
                 if ExpandedPianoRollPopup:
                     if self.expanded_popup is None:
                         print("DEBUG: Creating popup instance")
@@ -267,13 +263,21 @@ class AuraBeatApp(App):
                         self.expanded_popup = None
                 else:
                     print("ERROR: ExpandedPianoRollPopup is None")
-
                 return True
 
         except Exception as e:
             print("ERROR in _on_key_down:", e)
 
         return False
+
+    # ============================================================
+    # Mute toggle
+    # ============================================================
+    def set_muted(self, is_muted: bool):
+        self.is_muted = bool(is_muted)
+        if self.controller:
+            self.controller.muted = self.is_muted
+        print(f"DEBUG: Mute {'ON' if is_muted else 'OFF'}")
 
     # ============================================================
     # Record toggle
@@ -283,25 +287,53 @@ class AuraBeatApp(App):
             print("Recorder or bridge not initialized")
             return
 
-        # Start recording
         if not getattr(self.recorder, "is_recording", False):
+            # Clear previous notes before starting new recording
+            if self.piano_roll:
+                self.piano_roll.note_canvas.notes = []
             self.recorder.start()
             print("Recording started")
+        else:
+            self.recorder.stop()
+            print("Recording stopped")
+            try:
+                self.bridge.apply_recorded_events()
+            except Exception as e:
+                print("Failed to apply recorded events:", e)
+
+    # ============================================================
+    # Playback toggle
+    # ============================================================
+    def toggle_playback(self):
+        if not self.playback:
+            print("Playback not initialized")
             return
 
-        # Stop recording
-        self.recorder.stop()
-        print("Recorded events (first 4):")
-        for ev in self.recorder.events[:4]:
-            print(f"{ev.pitch}  start={ev.start:.3f}  end={ev.end:.3f}  {ev.hand}-{ev.finger}")
+        if self.playback.is_playing:
+            self.playback.stop()
+            self.is_playing_back = False
+            if self.controller:
+                self.controller.muted = False
+            print("Playback stopped")
+        else:
+            if not self.piano_roll or not self.piano_roll.note_canvas.notes:
+                print("No notes to play back")
+                return
+            if self.controller:
+                self.controller.muted = True
+            self.is_playing_back = True
+            self.playback.stop()
+            self.playback.play()
+            print("Playback started")
+            Clock.schedule_interval(self._check_playback_done, 0.1)
 
-        print("Recording stopped")
-
-        # Push events into the piano roll
-        try:
-            self.bridge.apply_recorded_events()
-        except Exception as e:
-            print("Failed to apply recorded events:", e)
+    def _check_playback_done(self, dt):
+        if not self.playback or not self.playback.is_playing:
+            self.is_playing_back = False
+            if self.controller:
+                self.controller.muted = False
+            print("Playback finished")
+            return False
 
     # ============================================================
     # Open finger → key mapping dialog
@@ -325,19 +357,13 @@ class AuraBeatApp(App):
             print("ERROR: Failed to open KeySelectDialog:", e)
 
     def _after_mapping_change(self):
-        """
-        Called after the user selects a new key.
-        Refresh overlay labels and redraw piano roll if needed.
-        """
         print("DEBUG: Mapping changed → refreshing overlay labels")
-
         try:
             overlay = self.root.ids.get("overlay")
             if overlay:
                 overlay.refresh_labels()
         except Exception as e:
             print("ERROR: Failed to refresh overlay labels:", e)
-
 
 
 if __name__ == "__main__":

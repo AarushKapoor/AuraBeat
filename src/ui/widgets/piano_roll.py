@@ -1,3 +1,4 @@
+# src/ui/widgets/piano_roll.py
 from kivy.uix.widget import Widget
 from kivy.uix.scrollview import ScrollView
 from kivy.graphics import (
@@ -22,10 +23,9 @@ class NoteCanvas(Widget):
     """
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.notes = []  # list of NoteEvent objects or dicts
+        self.notes = []
 
         with self.canvas:
-            # Transparent background so your panel visuals show through
             Color(0, 0, 0, 0)
             self.bg = Rectangle(pos=self.pos, size=self.size)
 
@@ -38,33 +38,31 @@ class NoteCanvas(Widget):
     def redraw_notes(self, time_grid, pitch_to_x):
         self.canvas.clear()
 
-        # Transparent background
         with self.canvas:
             Color(0, 0, 0, 0)
             Rectangle(pos=self.pos, size=self.size)
 
+        canvas_h = self.height
+
         for note in self.notes:
-            # Support both dict and object
             pitch = note.pitch if hasattr(note, "pitch") else note["pitch"]
             start = note.start if hasattr(note, "start") else note["start"]
             end   = note.end   if hasattr(note, "end")   else note["end"]
 
-            y = time_grid.time_to_y(start)
             h = time_grid.duration_to_height(end - start)
+            y_end = time_grid.time_to_y(end)
+
+            # Flip: notes fall from top down toward the strike line
+            y = canvas_h - y_end
             x = pitch_to_x(pitch, self.width)
 
             with self.canvas:
                 Color(0.2, 0.7, 1.0, 1.0)
-                Rectangle(pos=(x, y), size=(dp(12), h))
+                Rectangle(pos=(self.x + x, self.y + y), size=(dp(12), h))
 
     def add_note(self, *, x, y, height, pitch=None, start_ms=None, end_ms=None, color=(0.2, 0.7, 1.0, 1.0)):
-        """
-        Draw a note rectangle directly onto the canvas.
-        The bridge passes pixel coordinates + metadata.
-        """
-        width = dp(12)  # fixed note width for now
+        width = dp(12)
 
-        # Store the note if you want redraw support later
         self.notes.append({
             "x": x,
             "y": y,
@@ -75,7 +73,6 @@ class NoteCanvas(Widget):
             "end": end_ms,
         })
 
-        # Draw immediately
         with self.canvas:
             Color(*color)
             Rectangle(pos=(x, y), size=(width, height))
@@ -90,6 +87,7 @@ class PianoRollPanel(Widget):
     Synthesia-style piano roll:
     - Compact 7-key keyboard in normal mode
     - Full 88-key keyboard in expanded popup mode
+    Notes fall downward toward the strike line.
     """
     expanded = BooleanProperty(False)
 
@@ -102,7 +100,6 @@ class PianoRollPanel(Widget):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
-        # Scrollable falling-note canvas
         self.scroll = ScrollView(
             size_hint=(1, 1),
             bar_width=0,
@@ -115,17 +112,17 @@ class PianoRollPanel(Widget):
         self.scroll.add_widget(self.note_canvas)
         self.add_widget(self.scroll)
 
-        # Drawing group
         self._g = InstructionGroup()
         self.canvas.add(self._g)
         self._border_tex = None
 
-        # Redraw bindings
         self.bind(
             pos=self._redraw, size=self._redraw,
             expanded=self._redraw,
-            keyboard_height_ratio=self._redraw, show_chevrons=self._redraw,
-            strike_line_color=self._redraw, strike_line_thickness_dp=self._redraw
+            keyboard_height_ratio=self._redraw,
+            show_chevrons=self._redraw,
+            strike_line_color=self._redraw,
+            strike_line_thickness_dp=self._redraw
         )
 
     # ============================================================
@@ -134,10 +131,6 @@ class PianoRollPanel(Widget):
 
     @property
     def strike_line_y(self):
-        """
-        Logical strike line Y used by playback (same as visual boundary
-        between keyboard and falling-note track in panel coordinates).
-        """
         kb_h = max(dp(40), self.height * float(self.keyboard_height_ratio))
         return self.y + kb_h
 
@@ -181,16 +174,17 @@ class PianoRollPanel(Widget):
         track_y = y0 + kb_h
         track_h = max(0, H - kb_h)
 
+        # ScrollView sits above the keyboard
         self.scroll.pos = (x0, track_y)
         self.scroll.size = (W, track_h)
 
         self.note_canvas.width = W
 
-        # Background
+        # Panel background
         self._g.add(Color(0x12/255., 0x1C/255., 0x2A/255., 0.72))
         self._g.add(Rectangle(pos=(x0, y0), size=(W, H)))
 
-        # Feathered accents
+        # Feathered vertical accents
         if H > 0:
             accent_len = max(dp(30), H / 3.0)
             yc = y0 + H / 2.0
@@ -198,14 +192,22 @@ class PianoRollPanel(Widget):
             razor = max(1.0, dp(1.2))
 
             self._g.add(Color(1, 1, 1, 1))
-            self._g.add(Rectangle(pos=(x0, accent_y), size=(razor, accent_len), texture=self._border_tex))
-            self._g.add(Rectangle(pos=(x0 + W - razor, accent_y), size=(razor, accent_len), texture=self._border_tex))
+            self._g.add(Rectangle(
+                pos=(x0, accent_y),
+                size=(razor, accent_len),
+                texture=self._border_tex
+            ))
+            self._g.add(Rectangle(
+                pos=(x0 + W - razor, accent_y),
+                size=(razor, accent_len),
+                texture=self._border_tex
+            ))
 
         # Keyboard background
         self._g.add(Color(0x12/255., 0x1C/255., 0x2A/255., 0.72))
         self._g.add(Rectangle(pos=(x0, y0), size=(W, kb_h)))
 
-        # Strike line (visual)
+        # Strike line
         line_th = float(self.strike_line_thickness_dp)
         self._g.add(Color(*self.strike_line_color))
         self._g.add(Rectangle(
@@ -231,7 +233,10 @@ class PianoRollPanel(Widget):
             for i in range(1, 7):
                 sep_x = x0 + i * key_w
                 sep_x_int = int(round(sep_x))
-                self._g.add(Rectangle(pos=(sep_x_int - sep_w // 2, y0), size=(sep_w, kb_h)))
+                self._g.add(Rectangle(
+                    pos=(sep_x_int - sep_w // 2, y0),
+                    size=(sep_w, kb_h)
+                ))
 
             # Black keys
             black_boundaries = [0, 1, 3, 4, 5]
@@ -243,7 +248,10 @@ class PianoRollPanel(Widget):
                 cx = x0 + (j + 1) * key_w
                 bx = int(round(cx - bw / 2.0))
                 by = y0 + kb_h - bh
-                self._g.add(Rectangle(pos=(bx, by), size=(int(round(bw)), bh)))
+                self._g.add(Rectangle(
+                    pos=(bx, by),
+                    size=(int(round(bw)), bh)
+                ))
 
         else:
             # Full 88-key keyboard
@@ -263,7 +271,10 @@ class PianoRollPanel(Widget):
             sep_w = max(1, int(round(dp(1))))
             for i in range(1, WHITE_KEY_COUNT):
                 sx = x0 + i * white_w
-                self._g.add(Rectangle(pos=(sx - sep_w // 2, y0), size=(sep_w, kb_h)))
+                self._g.add(Rectangle(
+                    pos=(sx - sep_w // 2, y0),
+                    size=(sep_w, kb_h)
+                ))
 
             # Black keys
             self._g.add(Color(0.06, 0.06, 0.09, 1))
@@ -271,7 +282,7 @@ class PianoRollPanel(Widget):
             black_h = kb_h * 0.62
 
             white_index = 0
-            for midi in range(21, 109):  # A0 → C8
+            for midi in range(21, 109):
                 semitone = midi % 12
                 if semitone in BLACK_KEY_OFFSETS:
                     bx = x0 + white_index * white_w - black_w / 2.0
@@ -280,17 +291,15 @@ class PianoRollPanel(Widget):
                 else:
                     white_index += 1
 
-    # -----------------------------
-    # Pitch → X (compact 7-key mode)
-    # -----------------------------
+    # ============================================================
+    #  PITCH → X MAPPERS
+    # ============================================================
+
     def pitch_to_x_compact(self, pitch, width):
         key_w = width / 7.0
         scale_index = pitch % 7
         return scale_index * key_w
 
-    # -----------------------------
-    # Pitch → X (full 88-key mode)
-    # -----------------------------
     def pitch_to_x_expanded(self, pitch, width):
         WHITE_KEY_COUNT = 52
         BLACK_KEY_OFFSETS = [1, 3, 6, 8, 10]
@@ -305,15 +314,13 @@ class PianoRollPanel(Widget):
 
         return white_index * white_w
 
-    # -----------------------------
-    # Choose correct mapper
-    # -----------------------------
     def get_pitch_to_x(self):
         return self.pitch_to_x_expanded if self.expanded else self.pitch_to_x_compact
 
     # ============================================================
-    #  SCROLL REGION UPDATE (with full-screen padding)
+    #  SCROLL REGION UPDATE
     # ============================================================
+
     def update_scroll_region(self):
         if not self.note_canvas.notes:
             self.note_canvas.height = self.scroll.height + dp(200)
@@ -326,12 +333,10 @@ class PianoRollPanel(Widget):
             y_end = self.time_grid.time_to_y(end)
             max_y = max(max_y, y_end)
 
-        # Full-screen padding
         min_height = self.scroll.height + dp(200)
         target_h = max_y + dp(200)
 
         self.note_canvas.height = max(target_h, min_height)
 
+        # Start scrolled to top so notes fall into view from above
         self.scroll.scroll_y = 1.0
-
-
