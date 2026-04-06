@@ -5,3 +5,11 @@ TIP_TO_NAME = {4:"Thumb", 8:"Index", 12:"Middle", 16:"Ring", 20:"Pinky"}
 RIGHT_PLAY_ORDER = [THUMB_TIP, INDEX_TIP, MIDDLE_TIP, RING_TIP, PINKY_TIP]
 LEFT_PLAY_ORDER  = [THUMB_TIP, INDEX_TIP, MIDDLE_TIP, RING_TIP, PINKY_TIP]
 TIP_TO_PIP = {4:3, 8:6, 12:10, 16:14, 20:18}
+
+FINGER_TO_INDEX = {
+    "Thumb": 0,
+    "Index": 1,
+    "Middle": 2,
+    "Ring": 3,
+    "Pinky": 4,
+}

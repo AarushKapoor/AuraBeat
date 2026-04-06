@@ -1,9 +1,11 @@
-# src/ui/kv.py
 KV = r"""
 #:kivy 2.3.0
 #:import dp kivy.metrics.dp
 
 <RootView>:
+    video: video
+    overlay: overlay
+
     canvas.before:
         Color:
             rgba: (0x1A/255., 0x2B/255., 0x43/255., 1)
@@ -61,24 +63,24 @@ KV = r"""
 
             # ------------------ Column 3 (Right) ----------------------
             PianoRollPanel:
-                id: roll
+                id: pianoroll
                 size_hint_x: 0.2
                 keyboard_height_ratio: 0.18
                 show_chevrons: False
 
-
-        
         UpperDock:
+            id: upper_dock
             x: overlay.parent.x + overlay.x
             y: root.top - self.height - dp(10)
             size_hint: None, None
             width: overlay.width
-            height: self.pill_height_dp  # optional: or leave a fixed dp(...) if you prefer
+            height: self.pill_height_dp
+
         LowerDock:
+            id: lower_dock
             x: overlay.parent.x + overlay.x
             y: root.y + dp(10)
             size_hint: None, None
             width: overlay.width
             height: self.pill_height_dp
-
 """
